@@ -1,0 +1,52 @@
+[Unit]
+Description=claude-a2a A2A server
+Documentation=https://github.com/anthropics/claude-a2a
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-a2a
+Group=claude-a2a
+WorkingDirectory=/opt/claude-a2a
+
+ExecStart=/usr/bin/node /opt/claude-a2a/dist/cli.js serve --config /etc/claude-a2a/config.yaml
+
+# Environment
+Environment=NODE_ENV=production
+EnvironmentFile=-/etc/claude-a2a/env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/claude-a2a
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=false
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=2G
+CPUQuota=200%
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-a2a
+
+[Install]
+WantedBy=multi-user.target

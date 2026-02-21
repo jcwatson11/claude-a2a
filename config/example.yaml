@@ -1,0 +1,79 @@
+# claude-a2a example configuration
+# Copy to /etc/claude-a2a/config.yaml or ./config.yaml
+
+server:
+  host: "0.0.0.0"
+  port: 8462
+  tls:
+    enabled: false
+    cert_file: null
+    key_file: null
+  max_concurrent: 4
+  request_timeout: 300
+
+auth:
+  # Master key: set via CLAUDE_A2A_MASTER_KEY env var
+  master_key: null
+  jwt:
+    # JWT secret: set via CLAUDE_A2A_JWT_SECRET env var
+    secret: null
+    algorithm: "HS256"
+    default_expiry_hours: 720  # 30 days
+
+sessions:
+  max_lifetime_hours: 168   # 7 days
+  max_idle_hours: 24
+  max_per_client: 50
+
+rate_limiting:
+  enabled: true
+  requests_per_minute: 30
+  burst: 5
+
+budgets:
+  global_daily_limit_usd: 100.0
+  default_client_daily_limit_usd: 25.0
+
+claude:
+  binary: "claude"
+  default_model: null  # uses claude's default
+  default_permission_mode: "default"
+  work_dir: "/var/lib/claude-a2a/workdir"
+
+agents:
+  general:
+    description: "General-purpose Claude assistant"
+    enabled: true
+    model: null
+    append_system_prompt: "You are responding via the claude-a2a A2A API. Be concise."
+    settings_file: null
+    permission_mode: "default"
+    allowed_tools:
+      - "Read(*)"
+      - "Glob(*)"
+      - "Grep(*)"
+      - "WebSearch(*)"
+      - "WebFetch(*)"
+    max_budget_usd: 1.0
+    required_scopes:
+      - "agent:general"
+    work_dir: null
+
+  # Example: a code-focused agent
+  # code:
+  #   description: "Code-focused Claude agent with file editing"
+  #   enabled: false
+  #   model: "claude-sonnet-4-6"
+  #   append_system_prompt: "You are a code assistant responding via A2A API."
+  #   permission_mode: "default"
+  #   allowed_tools:
+  #     - "Read(*)"
+  #     - "Write(*)"
+  #     - "Edit(*)"
+  #     - "Glob(*)"
+  #     - "Grep(*)"
+  #     - "Bash(*)"
+  #   max_budget_usd: 5.0
+  #   required_scopes:
+  #     - "agent:code"
+  #   work_dir: "/home/code-agent/workspace"

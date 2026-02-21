@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.tgz
+
+*.log
+pids/
+*.pid
+*.seed
+
+.env
+.env.*
+
+*.tsbuildinfo
