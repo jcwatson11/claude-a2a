@@ -1,5 +1,5 @@
 {
-  "name": "claude-a2a",
+  "name": "claude-a2a-cli",
   "version": "0.1.0",
   "description": "A2A-compatible server wrapping the Claude CLI for agent-to-agent communication",
   "type": "module",
