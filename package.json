@@ -8,8 +8,8 @@
     "config/example.yaml"
   ],
   "bin": {
-    "claude-a2a": "./dist/cli.js",
-    "claude-a2a-client": "./dist/client.js"
+    "claude-a2a": "dist/cli.js",
+    "claude-a2a-client": "dist/client.js"
   },
   "scripts": {
     "build": "node esbuild.config.js",
