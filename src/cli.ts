@@ -34,7 +34,8 @@ Options:
 }
 
 if (values.version) {
-  console.log("claude-a2a 0.1.0");
+  const { VERSION } = await import("./version.js");
+  console.log(`claude-a2a ${VERSION}`);
   process.exit(0);
 }
 

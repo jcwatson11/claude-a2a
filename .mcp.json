@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "claude-a2a": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/root/claude-a2a/dist/client.js"]
+    }
+  }
+}

@@ -2,11 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ClientConfig } from "./config.js";
 import { A2AClient } from "./a2a-client.js";
+import { VERSION } from "../version.js";
 
 export function createMcpServer(config: ClientConfig): McpServer {
   const server = new McpServer({
     name: "claude-a2a-client",
-    version: "0.1.0",
+    version: VERSION,
   });
 
   // Cache A2A clients per server

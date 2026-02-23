@@ -50,6 +50,43 @@ agents:
     expect(config.agents["custom"]!.max_budget_usd).toBe(5.0);
   });
 
+  it("rejects JWT algorithm 'none'", () => {
+    const configPath = join(tmpDir, "none-alg.yaml");
+    writeFileSync(
+      configPath,
+      `
+auth:
+  jwt:
+    algorithm: "none"
+`,
+    );
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it("rejects unsupported JWT algorithms", () => {
+    const configPath = join(tmpDir, "bad-alg.yaml");
+    writeFileSync(
+      configPath,
+      `
+auth:
+  jwt:
+    algorithm: "RS256"
+`,
+    );
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it("accepts valid JWT algorithms", () => {
+    for (const alg of ["HS256", "HS384", "HS512"]) {
+      const configPath = join(tmpDir, `${alg}.yaml`);
+      writeFileSync(configPath, `\nauth:\n  jwt:\n    algorithm: "${alg}"\n`);
+      const config = loadConfig(configPath);
+      expect(config.auth.jwt.algorithm).toBe(alg);
+    }
+  });
+
   it("applies env var overrides", () => {
     process.env["CLAUDE_A2A_MASTER_KEY"] = "test-key-123";
     process.env["CLAUDE_A2A_JWT_SECRET"] = "jwt-secret-456";
@@ -59,5 +96,31 @@ agents:
     expect(config.auth.master_key).toBe("test-key-123");
     expect(config.auth.jwt.secret).toBe("jwt-secret-456");
     expect(config.server.port).toBe(7777);
+  });
+
+  it("derives work_dir from data_dir when not set", () => {
+    const config = loadConfig("/nonexistent/path.yaml");
+    expect(config.data_dir).toBe("/var/lib/claude-a2a");
+    expect(config.claude.work_dir).toBe("/var/lib/claude-a2a/workdir");
+  });
+
+  it("respects explicit work_dir over data_dir", () => {
+    const configPath = join(tmpDir, "workdir.yaml");
+    writeFileSync(configPath, `
+data_dir: "/data/a2a"
+claude:
+  work_dir: "/custom/workdir"
+`);
+    const config = loadConfig(configPath);
+    expect(config.data_dir).toBe("/data/a2a");
+    expect(config.claude.work_dir).toBe("/custom/workdir");
+  });
+
+  it("applies CLAUDE_A2A_DATA_DIR env var", () => {
+    process.env["CLAUDE_A2A_DATA_DIR"] = "/docker/volume";
+    const config = loadConfig("/nonexistent/path.yaml");
+    expect(config.data_dir).toBe("/docker/volume");
+    expect(config.claude.work_dir).toBe("/docker/volume/workdir");
+    delete process.env["CLAUDE_A2A_DATA_DIR"];
   });
 });

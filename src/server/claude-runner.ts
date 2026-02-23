@@ -1,40 +1,57 @@
-import { spawn } from "node:child_process";
 import type { Logger } from "pino";
+import { z } from "zod";
 import type { AgentConfig, Config } from "./config.js";
+import { ClaudeSession, ClaudeSessionError, SessionBusyError, type ContentBlock } from "./claude-session.js";
+import type { SqliteTaskStore } from "./services/task-store.js";
+import type { SessionStore } from "./services/session-store.js";
 
-export interface ClaudeResponse {
-  result: string;
-  session_id: string;
-  is_error: boolean;
-  duration_ms: number;
-  duration_api_ms: number;
-  num_turns: number;
-  total_cost_usd: number;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    cache_creation_input_tokens: number;
-    cache_read_input_tokens: number;
-  };
-  model_used: string;
-  permission_denials: string[];
-  context?: {
-    used_tokens: number;
-    max_tokens: number;
-    remaining_tokens: number;
-    compact_recommended: boolean;
-  };
-}
+// ---------------------------------------------------------------------------
+// Response schema (unchanged — used by executor, budget tracker, tests)
+// ---------------------------------------------------------------------------
+
+export const ClaudeResponseSchema = z.object({
+  result: z.string(),
+  session_id: z.string(),
+  is_error: z.boolean(),
+  duration_ms: z.number(),
+  duration_api_ms: z.number(),
+  num_turns: z.number(),
+  total_cost_usd: z.number(),
+  usage: z.object({
+    input_tokens: z.number(),
+    output_tokens: z.number(),
+    cache_creation_input_tokens: z.number().default(0),
+    cache_read_input_tokens: z.number().default(0),
+  }),
+  model_used: z.string(),
+  permission_denials: z.array(z.string()).default([]),
+  context: z.object({
+    used_tokens: z.number(),
+    max_tokens: z.number(),
+    remaining_tokens: z.number(),
+    compact_recommended: z.boolean(),
+  }).optional(),
+});
+
+export type ClaudeResponse = z.infer<typeof ClaudeResponseSchema>;
 
 export interface RunOptions {
   agentName: string;
   agentConfig: AgentConfig;
-  message: string;
-  sessionId?: string;
+  message: string | ContentBlock[];
+  contextId: string;
+  taskId?: string;
+  /** Claude session ID for resuming after process death. Typically supplied by SessionStore. */
+  resumeSessionId?: string;
 }
 
+// ---------------------------------------------------------------------------
+// ClaudeRunner — session pool manager
+// ---------------------------------------------------------------------------
+
 export class ClaudeRunner {
-  private activeCount = 0;
+  private readonly sessions = new Map<string, ClaudeSession>();
+  private readonly taskToContext = new Map<string, string>();
   private readonly maxConcurrent: number;
   private readonly requestTimeout: number;
   private readonly config: Config;
@@ -47,186 +64,235 @@ export class ClaudeRunner {
     this.log = log.child({ component: "claude-runner" });
   }
 
+  /** Number of active sessions (live Claude processes). */
   get concurrentCount(): number {
-    return this.activeCount;
+    return this.sessions.size;
   }
 
+  /** Whether we're at the maximum number of concurrent sessions. */
   get isFull(): boolean {
-    return this.activeCount >= this.maxConcurrent;
+    return this.sessions.size >= this.maxConcurrent;
   }
 
-  async run(options: RunOptions): Promise<ClaudeResponse> {
-    if (this.isFull) {
-      throw new CapacityError(
-        `At capacity (${this.activeCount}/${this.maxConcurrent})`,
+  /** Check if a live session exists for a contextId. */
+  hasSession(contextId: string): boolean {
+    const session = this.sessions.get(contextId);
+    return !!session && session.isAlive;
+  }
+
+  /** Get the PID of the Claude process for a contextId, if a live session exists. */
+  getSessionPid(contextId: string): number | undefined {
+    return this.sessions.get(contextId)?.pid;
+  }
+
+  /**
+   * Send a message to the session for a contextId.
+   * Creates a new session if none exists. Reuses existing session otherwise.
+   * Throws CapacityError if no session exists and we're at capacity.
+   * Throws SessionBusyError if the session is currently processing.
+   */
+  async sendMessage(options: RunOptions): Promise<ClaudeResponse> {
+    let session = this.sessions.get(options.contextId);
+
+    // If session is dead, remove it and allow re-creation
+    if (session && !session.isAlive) {
+      this.sessions.delete(options.contextId);
+      session = undefined;
+    }
+
+    // Create new session if needed
+    if (!session) {
+      if (this.isFull) {
+        throw new CapacityError(
+          `At capacity (${this.sessions.size}/${this.maxConcurrent})`,
+        );
+      }
+
+      this.log.info(
+        {
+          agent: options.agentName,
+          contextId: options.contextId,
+          resumeSessionId: options.resumeSessionId,
+          concurrent: this.sessions.size + 1,
+        },
+        "creating new claude session",
       );
+
+      session = new ClaudeSession({
+        agentName: options.agentName,
+        agentConfig: options.agentConfig,
+        config: this.config,
+        log: this.log,
+        resumeSessionId: options.resumeSessionId,
+      });
+
+      session.onDeath = (err) => {
+        this.log.warn(
+          { contextId: options.contextId, error: err.message },
+          "claude session died",
+        );
+        this.sessions.delete(options.contextId);
+      };
+
+      this.sessions.set(options.contextId, session);
     }
 
-    this.activeCount++;
-    try {
-      return await this.executeProcess(options);
-    } finally {
-      this.activeCount--;
+    // Track taskId → contextId for cancellation
+    if (options.taskId) {
+      this.taskToContext.set(options.taskId, options.contextId);
     }
-  }
 
-  private async executeProcess(options: RunOptions): Promise<ClaudeResponse> {
-    const { agentConfig, message, sessionId } = options;
-    const args = this.buildArgs(agentConfig, sessionId);
+    const response = await session.sendMessage(
+      options.message,
+      this.requestTimeout * 1000,
+    );
 
     this.log.info(
       {
         agent: options.agentName,
-        sessionId,
-        concurrent: this.activeCount,
+        contextId: options.contextId,
+        sessionId: response.session_id,
+        cost: response.total_cost_usd,
+        duration: response.duration_ms,
       },
-      "spawning claude process",
+      "claude message completed",
     );
 
-    return new Promise<ClaudeResponse>((resolve, reject) => {
-      const env = { ...process.env };
-      // Unset CLAUDECODE to avoid "nested session" error
-      delete env["CLAUDECODE"];
+    return response;
+  }
 
-      const workDir =
-        agentConfig.work_dir ?? this.config.claude.work_dir;
+  /** Destroy a specific session by contextId. */
+  destroySession(contextId: string): void {
+    const session = this.sessions.get(contextId);
+    if (session) {
+      session.destroy();
+      this.sessions.delete(contextId);
+      this.log.info({ contextId }, "session destroyed");
+    }
+  }
 
-      const proc = spawn(this.config.claude.binary, args, {
-        env,
-        cwd: workDir,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+  /** Kill all active sessions (used for explicit kills: admin, task cancellation, tests). */
+  killAll(): void {
+    for (const [contextId, session] of this.sessions) {
+      session.destroy();
+      this.log.debug({ contextId }, "killing session");
+    }
+    this.sessions.clear();
+    this.taskToContext.clear();
+  }
 
-      let stdout = "";
-      let stderr = "";
-
-      proc.stdout.on("data", (data: Buffer) => {
-        stdout += data.toString();
-      });
-      proc.stderr.on("data", (data: Buffer) => {
-        stderr += data.toString();
-      });
-
-      const timeout = setTimeout(() => {
-        proc.kill("SIGTERM");
-        setTimeout(() => {
-          if (!proc.killed) proc.kill("SIGKILL");
-        }, 5000);
-        reject(new TimeoutError(`Claude process timed out after ${this.requestTimeout}s`));
-      }, this.requestTimeout * 1000);
-
-      proc.on("error", (err) => {
-        clearTimeout(timeout);
-        reject(new ClaudeProcessError(`Failed to spawn claude: ${err.message}`, stderr));
-      });
-
-      proc.on("close", (code) => {
-        clearTimeout(timeout);
-
-        if (code !== 0) {
-          this.log.warn({ code, stderr: stderr.slice(0, 500) }, "claude process exited with error");
-          reject(new ClaudeProcessError(`Claude exited with code ${code}`, stderr));
-          return;
-        }
-
+  /**
+   * Release all active sessions during graceful shutdown.
+   * Processes continue running independently. In-flight tasks are updated
+   * to "working" status with an informative message.
+   */
+  async releaseAll(taskStore: SqliteTaskStore): Promise<void> {
+    // Update in-flight tasks before releasing sessions
+    for (const [taskId, contextId] of this.taskToContext) {
+      const session = this.sessions.get(contextId);
+      if (session?.isAlive) {
         try {
-          const parsed = JSON.parse(stdout) as Record<string, unknown>;
-          const response = mapResponse(parsed);
-          this.log.info(
-            {
-              agent: options.agentName,
-              sessionId: response.session_id,
-              cost: response.total_cost_usd,
-              duration: response.duration_ms,
-            },
-            "claude process completed",
-          );
-          resolve(response);
+          const task = await taskStore.load(taskId);
+          if (task && task.status.state === "working") {
+            task.status = {
+              state: "working",
+              message: {
+                kind: "message",
+                messageId: `shutdown-${Date.now()}`,
+                role: "agent",
+                parts: [{
+                  kind: "text",
+                  text: "Server restarting — the agent is still processing. Reconnect with the same contextId to retrieve results.",
+                }],
+                contextId,
+              },
+              timestamp: new Date().toISOString(),
+            };
+            await taskStore.save(task);
+            this.log.info({ taskId, contextId }, "updated in-flight task status for shutdown");
+          }
         } catch (err) {
-          reject(
-            new ClaudeProcessError(
-              `Failed to parse claude output: ${err instanceof Error ? err.message : String(err)}`,
-              stdout.slice(0, 1000),
-            ),
+          this.log.warn(
+            { taskId, error: err instanceof Error ? err.message : String(err) },
+            "failed to update task status during shutdown",
           );
         }
-      });
+      }
+    }
 
-      // Write the message to stdin
-      proc.stdin.write(message);
-      proc.stdin.end();
-    });
+    // Release all sessions (close stdin, unref — process continues)
+    for (const [contextId, session] of this.sessions) {
+      session.release();
+      this.log.info({ contextId, pid: session.pid }, "released session (process continues)");
+    }
+    this.sessions.clear();
+    this.taskToContext.clear();
   }
 
-  private buildArgs(agentConfig: AgentConfig, sessionId?: string): string[] {
-    const args = ["-p", "--output-format", "json"];
-
-    if (sessionId) {
-      args.push("--resume", sessionId);
+  /**
+   * Cancel a specific task's session. Returns true if found and destroyed.
+   * Also handles orphaned processes from before a restart (via sessionStore PID lookup).
+   */
+  cancelByTaskId(taskId: string, sessionStore?: SessionStore): boolean {
+    const contextId = this.taskToContext.get(taskId);
+    if (contextId) {
+      const session = this.sessions.get(contextId);
+      if (session?.isAlive) {
+        session.destroy();
+        this.sessions.delete(contextId);
+        this.taskToContext.delete(taskId);
+        this.log.info({ taskId, contextId }, "cancelled session for task");
+        return true;
+      }
     }
 
-    const model = agentConfig.model ?? this.config.claude.default_model;
-    if (model) {
-      args.push("--model", model);
-    }
-
-    if (agentConfig.settings_file) {
-      args.push("--settings", agentConfig.settings_file);
-    }
-
-    const permMode =
-      agentConfig.permission_mode ?? this.config.claude.default_permission_mode;
-    if (permMode) {
-      args.push("--permission-mode", permMode);
-    }
-
-    if (agentConfig.allowed_tools.length > 0) {
-      args.push("--allowedTools", ...agentConfig.allowed_tools);
-    }
-
-    if (agentConfig.max_budget_usd) {
-      args.push("--max-budget-usd", agentConfig.max_budget_usd.toString());
-    }
-
-    if (agentConfig.append_system_prompt) {
-      args.push("--append-system-prompt", agentConfig.append_system_prompt);
-    }
-
-    return args;
-  }
-}
-
-function mapResponse(raw: Record<string, unknown>): ClaudeResponse {
-  const usage = raw["usage"] as Record<string, number> | undefined;
-  const context = raw["context"] as Record<string, unknown> | undefined;
-  const permDenials = raw["permission_denials"] as string[] | undefined;
-
-  return {
-    result: String(raw["result"] ?? ""),
-    session_id: String(raw["session_id"] ?? ""),
-    is_error: Boolean(raw["is_error"]),
-    duration_ms: Number(raw["duration_ms"] ?? 0),
-    duration_api_ms: Number(raw["duration_api_ms"] ?? 0),
-    num_turns: Number(raw["num_turns"] ?? 1),
-    total_cost_usd: Number(raw["total_cost_usd"] ?? 0),
-    usage: {
-      input_tokens: Number(usage?.["input_tokens"] ?? 0),
-      output_tokens: Number(usage?.["output_tokens"] ?? 0),
-      cache_creation_input_tokens: Number(usage?.["cache_creation_input_tokens"] ?? 0),
-      cache_read_input_tokens: Number(usage?.["cache_read_input_tokens"] ?? 0),
-    },
-    model_used: String(raw["model_used"] ?? "unknown"),
-    permission_denials: permDenials ?? [],
-    context: context
-      ? {
-          used_tokens: Number(context["used_tokens"] ?? 0),
-          max_tokens: Number(context["max_tokens"] ?? 0),
-          remaining_tokens: Number(context["remaining_tokens"] ?? 0),
-          compact_recommended: Boolean(context["compact_recommended"]),
+    // No live session — check for orphaned process via session store
+    if (sessionStore) {
+      const sessionMeta = sessionStore.getByTaskId(taskId);
+      if (sessionMeta) {
+        const pid = sessionStore.getLastPid(sessionMeta.contextId);
+        if (pid) {
+          return this.killOrphanPid(pid, taskId, sessionMeta.contextId);
         }
-      : undefined,
-  };
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Kill an orphaned process by PID. Returns true if the process was found and killed.
+   */
+  private killOrphanPid(pid: number, taskId: string, contextId: string): boolean {
+    try {
+      process.kill(pid, 0); // existence check
+    } catch {
+      // Process is already dead
+      return false;
+    }
+
+    this.log.info({ pid, taskId, contextId }, "killing orphaned process");
+    try {
+      process.kill(pid, "SIGTERM");
+      // Schedule SIGKILL as fallback
+      setTimeout(() => {
+        try {
+          process.kill(pid, 0); // still alive?
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // already dead
+        }
+      }, 5000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
+
+// ---------------------------------------------------------------------------
+// Error classes (re-exported for backward compatibility)
+// ---------------------------------------------------------------------------
 
 export class CapacityError extends Error {
   constructor(message: string) {
@@ -250,3 +316,5 @@ export class ClaudeProcessError extends Error {
     this.stderr = stderr;
   }
 }
+
+export { SessionBusyError, ClaudeSessionError };

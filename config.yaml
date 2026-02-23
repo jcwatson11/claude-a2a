@@ -1,0 +1,36 @@
+server:
+  host: "127.0.0.1"
+  port: 8462
+  max_concurrent: 2
+  request_timeout: 300
+  max_body_size: "10mb"
+
+auth:
+  # Set via env vars: CLAUDE_A2A_MASTER_KEY, CLAUDE_A2A_JWT_SECRET
+  jwt:
+    debug: true  # show auth errors during testing
+
+sessions:
+  process_idle_timeout_minutes: 15
+
+budgets:
+  global_daily_limit_usd: 10.0
+  default_client_daily_limit_usd: 5.0
+
+data_dir: "/var/lib/claude-a2a"
+
+claude:
+  binary: "claude"
+
+agents:
+  example:
+    description: "Agent working on the example project in /root/example"
+    enabled: true
+    model: null
+    append_system_prompt: "You are an assistant working on a project. Be concise. You are responding via the claude-a2a A2A API."
+    permission_mode: "default"
+    settings_file: "/root/example/.claude/settings.json"
+    allowed_tools: []
+    max_budget_usd: 2.0
+    required_scopes: []
+    work_dir: "/root/example"

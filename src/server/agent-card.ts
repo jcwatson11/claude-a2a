@@ -1,5 +1,6 @@
-import type { AgentCard, AgentSkill } from "@a2a-js/sdk";
+import type { AgentCard, AgentSkill, SecurityScheme } from "@a2a-js/sdk";
 import type { Config } from "./config.js";
+import { VERSION } from "../version.js";
 
 export function buildAgentCard(config: Config): AgentCard {
   const baseUrl = `http://${config.server.host === "0.0.0.0" ? "localhost" : config.server.host}:${config.server.port}`;
@@ -23,12 +24,12 @@ export function buildAgentCard(config: Config): AgentCard {
     });
   }
 
-  const securitySchemes: Record<string, Record<string, string>> = {};
+  const securitySchemes: Record<string, SecurityScheme> = {};
   const security: Record<string, string[]>[] = [];
 
   if (config.auth.master_key) {
     securitySchemes["bearerAuth"] = {
-      type: "http",
+      type: "http" as const,
       scheme: "bearer",
     };
     security.push({ bearerAuth: [] });
@@ -36,7 +37,7 @@ export function buildAgentCard(config: Config): AgentCard {
 
   if (config.auth.jwt.secret) {
     securitySchemes["jwtAuth"] = {
-      type: "http",
+      type: "http" as const,
       scheme: "bearer",
       bearerFormat: "JWT",
     };
@@ -50,14 +51,14 @@ export function buildAgentCard(config: Config): AgentCard {
       "Supports session continuity, budget tracking, and multi-agent configurations.",
     url: `${baseUrl}/a2a/jsonrpc`,
     protocolVersion: "0.3.0",
-    version: "0.1.0",
+    version: VERSION,
     skills,
     capabilities: {
       streaming: false,
       pushNotifications: false,
       stateTransitionHistory: true,
     },
-    defaultInputModes: ["text"],
+    defaultInputModes: ["text", "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"],
     defaultOutputModes: ["text"],
     preferredTransport: "JSONRPC",
     additionalInterfaces: [
@@ -68,7 +69,7 @@ export function buildAgentCard(config: Config): AgentCard {
       url: baseUrl,
     },
     ...(security.length > 0
-      ? { security, securitySchemes: securitySchemes as AgentCard["securitySchemes"] }
+      ? { security, securitySchemes }
       : {}),
   };
 }

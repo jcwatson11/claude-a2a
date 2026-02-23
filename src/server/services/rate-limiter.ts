@@ -11,11 +11,23 @@ export class RateLimiter {
   private readonly rpm: number;
   private readonly burst: number;
   private readonly enabled: boolean;
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Config) {
     this.enabled = config.rate_limiting.enabled;
     this.rpm = config.rate_limiting.requests_per_minute;
     this.burst = config.rate_limiting.burst;
+  }
+
+  start(): void {
+    this.cleanupTimer = setInterval(() => this.cleanup(), 60_000);
+  }
+
+  stop(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
   }
 
   middleware() {
@@ -71,6 +83,11 @@ export class RateLimiter {
     }
 
     return false;
+  }
+
+  /** Number of tracked client buckets (for monitoring/testing). */
+  get bucketCount(): number {
+    return this.buckets.size;
   }
 
   /** Clean up old buckets periodically */

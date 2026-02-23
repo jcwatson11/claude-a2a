@@ -1,6 +1,6 @@
 # claude-a2a
 
-An A2A-compatible server that wraps the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), enabling any A2A client to send messages to Claude agents on a machine and receive responses. Also includes an MCP client so that interactive Claude Code sessions can natively call remote agents.
+An A2A-compatible server that wraps the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code), enabling any A2A client to send messages to Claude agents on a machine and receive responses. Supports multimodal input (images, PDFs), session continuity, multi-agent configurations, and cost tracking. Also includes an MCP client so that interactive Claude Code sessions can natively call remote agents.
 
 ## What problem does this solve?
 
@@ -39,24 +39,40 @@ Remote Agent / A2A Client
 |  Auth layer      |   Master key / JWT tokens
 |  Rate limiter    |
 |  Budget tracker  |
-|  Claude Runner   |   --> spawns: claude -p --output-format json --resume <session-id>
+|  Claude Session  |   Long-lived claude CLI process (stream-json NDJSON I/O)
 +------------------+
         |
         v
    Claude CLI (local)
 ```
 
-The core insight is that `claude -p --output-format json --resume <session-id>` provides stateless invocation with session continuity. claude-a2a maps A2A protocol concepts onto this:
+The server spawns a long-lived Claude CLI process per session using `--input-format stream-json --output-format stream-json`. Messages are sent as NDJSON on stdin and results are read from stdout. Session continuity is maintained by keeping the process alive across messages, with `--resume` for recovery after restarts.
 
 | A2A Concept | claude-a2a Implementation |
 |---|---|
 | Agent Card | Describes each configured Claude agent |
-| Message (user) | Forwarded to `claude -p` via stdin |
-| Message (agent) | Claude CLI's JSON response |
-| Task context | Maps to a Claude CLI session via `--resume` |
+| Message (user) | Written to Claude process stdin as NDJSON |
+| Message (agent) | Parsed from Claude process stdout result |
+| Task context | Maps to a long-lived Claude CLI session |
 | Skills | Agent configurations (tools, model, description) |
 
 Each response includes Claude-specific metadata (session ID, token usage, cost, model used) in the message's `metadata.claude` field.
+
+## Multimodal input
+
+claude-a2a supports sending images, PDFs, and structured data to Claude via A2A's `FilePart` and `DataPart` message types:
+
+| A2A Part Type | Claude Content Block |
+|---|---|
+| `TextPart` | Plain text (or `{ type: "text" }` block) |
+| `FilePart` (image MIME + base64) | `{ type: "image", source: { type: "base64" } }` |
+| `FilePart` (PDF/other MIME + base64) | `{ type: "document", source: { type: "base64" } }` |
+| `FilePart` (URI) | Text description (URI download not supported) |
+| `DataPart` | JSON stringified as text |
+
+Text-only messages are sent as plain strings for backward compatibility. When non-text parts are present, the message is sent as a `ContentBlock[]` array.
+
+Supported input MIME types are advertised in the Agent Card's `defaultInputModes`: `text`, `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `application/pdf`.
 
 ## Requirements
 
@@ -72,7 +88,7 @@ npm install
 npm run build
 
 # Start with a master key for auth
-CLAUDE_A2A_MASTER_KEY=my-secret-key node dist/cli.js serve
+CLAUDE_A2A_MASTER_KEY=my-secret-key ./dist/cli.js serve
 
 # In another terminal — check health
 curl http://localhost:8462/health
@@ -96,6 +112,8 @@ curl -X POST http://localhost:8462/a2a/jsonrpc \
     }
   }'
 ```
+
+> **Note:** If running from within a Claude Code session, the `CLAUDECODE` environment variable will cause spawned Claude processes to exit immediately. Start the server in a separate terminal or use `env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT` to unset it.
 
 ## Configuration
 
@@ -125,7 +143,7 @@ Secrets should be set via environment variables rather than in the config file:
 
 ### Key config sections
 
-**server** — Host, port, TLS, max concurrent Claude processes, request timeout.
+**server** — Host, port, TLS, max concurrent Claude processes, request timeout, max body size (default `10mb` to support base64-encoded files).
 
 **auth** — Master key and JWT settings. If neither is configured, the server allows unauthenticated access.
 
@@ -137,9 +155,9 @@ Secrets should be set via environment variables rather than in the config file:
 
 **claude** — Path to the `claude` binary, default model, default permission mode, and working directory.
 
-**agents** — The most important section. This is where you define your Agent Cards.
+**agents** — The most important section. This is where you define your agents.
 
-## Agent Cards
+## Agents
 
 In the A2A protocol, an **Agent Card** is a JSON document that describes what an agent can do. It is served at a well-known URL (`/.well-known/agent-card.json`) so that other agents and tools can discover and understand the agent's capabilities before sending it messages.
 
@@ -156,14 +174,9 @@ agents:
     enabled: true
     model: null                  # null = use Claude's default model
     append_system_prompt: "You are responding via the claude-a2a A2A API. Be concise."
-    settings_file: null          # path to a Claude settings file
+    settings_file: null          # path to a Claude Code settings.json file
     permission_mode: "default"   # Claude's permission mode
-    allowed_tools:               # which tools Claude can use
-      - "Read(*)"
-      - "Glob(*)"
-      - "Grep(*)"
-      - "WebSearch(*)"
-      - "WebFetch(*)"
+    allowed_tools: []            # passed as --allowedTools to the CLI
     max_budget_usd: 1.0          # max spend per invocation
     required_scopes:             # JWT scopes needed to use this agent
       - "agent:general"
@@ -178,9 +191,9 @@ agents:
 | `enabled` | Set to `false` to disable an agent without removing its config. |
 | `model` | Claude model to use (e.g. `claude-sonnet-4-6`). `null` uses the CLI default. |
 | `append_system_prompt` | Extra instructions appended to Claude's system prompt for this agent. |
-| `settings_file` | Path to a Claude Code settings JSON file (for advanced configuration). |
-| `permission_mode` | Claude's permission mode: `default`, `plan`, `bypasstool`, etc. |
-| `allowed_tools` | List of tools Claude is allowed to use. Uses glob patterns like `Read(*)`. |
+| `settings_file` | Path to a Claude Code settings JSON file. **Required for granting tool permissions in headless mode.** See [Permissions](#permissions). |
+| `permission_mode` | Claude's permission mode. See [Permissions](#permissions). |
+| `allowed_tools` | List of tools passed as `--allowedTools` to the CLI (e.g. `["Bash(git:*)"]`). |
 | `max_budget_usd` | Maximum spend (in USD) per single invocation. |
 | `required_scopes` | JWT scopes required to call this agent. Ignored for master key auth. |
 | `work_dir` | Working directory for Claude. Determines what files Claude can see. |
@@ -192,9 +205,6 @@ agents:
   general:
     description: "General-purpose assistant for questions and research"
     enabled: true
-    allowed_tools:
-      - "WebSearch(*)"
-      - "WebFetch(*)"
     max_budget_usd: 0.50
     required_scopes: ["agent:general"]
 
@@ -203,14 +213,8 @@ agents:
     enabled: true
     model: "claude-sonnet-4-6"
     append_system_prompt: "You are a code assistant. Focus on writing clean, correct code."
+    settings_file: "/home/projects/my-app/.claude/settings.json"
     permission_mode: "default"
-    allowed_tools:
-      - "Read(*)"
-      - "Write(*)"
-      - "Edit(*)"
-      - "Glob(*)"
-      - "Grep(*)"
-      - "Bash(*)"
     max_budget_usd: 5.0
     required_scopes: ["agent:code"]
     work_dir: "/home/projects/my-app"
@@ -218,10 +222,6 @@ agents:
   reviewer:
     description: "Code reviewer that reads code and provides feedback"
     enabled: true
-    allowed_tools:
-      - "Read(*)"
-      - "Glob(*)"
-      - "Grep(*)"
     max_budget_usd: 1.0
     required_scopes: ["agent:reviewer"]
     work_dir: "/home/projects/my-app"
@@ -238,6 +238,58 @@ curl http://localhost:8462/.well-known/agent-card.json
 ```
 
 This returns the full A2A Agent Card JSON, including all enabled agents as skills, supported authentication schemes, and capability declarations.
+
+## Permissions
+
+Claude CLI's permission system controls which tools the agent can use. This is critical for headless (non-interactive) operation because there is no human to approve permission prompts.
+
+### Permission modes
+
+The `permission_mode` field maps to `--permission-mode` on the CLI:
+
+| Mode | Behavior |
+|---|---|
+| `default` | Auto-approves reads. Writes and Bash require explicit allow rules in a settings file. **Recommended for headless use.** |
+| `acceptEdits` | Auto-approves file reads and writes within the project directory. Blocks Bash. |
+| `plan` | Enters planning workflow — not suitable for headless use. |
+| `dontAsk` | Denies all tool use that would normally prompt. |
+| `bypassPermissions` | Allows everything. **Cannot be used when running as root.** |
+
+### Settings file (recommended approach)
+
+The most reliable way to grant permissions for headless operation is via a Claude Code settings file. Set `settings_file` in the agent config to point at it, and use `permission_mode: "default"`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Write"
+    ]
+  }
+}
+```
+
+Place this file at `<work_dir>/.claude/settings.json` and reference it from the agent config:
+
+```yaml
+agents:
+  myagent:
+    work_dir: "/home/projects/my-app"
+    settings_file: "/home/projects/my-app/.claude/settings.json"
+    permission_mode: "default"
+```
+
+The settings file `allow` rules grant tool access that would otherwise require interactive approval. Without a settings file, most tools will be denied in headless mode.
+
+> **Path patterns:** In settings files, `/path` is relative to the settings file. Use `//path` for absolute filesystem paths (e.g. `Write(//tmp/**)`). Note that some system paths like `/tmp` may require blanket tool allow (`"Write"`) rather than path-scoped rules.
+
+### Running as root
+
+`bypassPermissions` mode is blocked when running as root for security. Use `default` mode with a settings file instead.
 
 ## Authentication
 
@@ -260,11 +312,11 @@ Scoped tokens with per-client controls. Generate them using the CLI:
 ```bash
 # Generate a token for "my-agent" with access to the "general" agent
 CLAUDE_A2A_JWT_SECRET=your-jwt-secret \
-  node dist/cli.js token my-agent agent:general
+  ./dist/cli.js token my-agent agent:general
 
 # Generate a token with access to all agents
 CLAUDE_A2A_JWT_SECRET=your-jwt-secret \
-  node dist/cli.js token my-agent '*'
+  ./dist/cli.js token my-agent '*'
 ```
 
 JWT claims can include:
@@ -318,7 +370,7 @@ curl -s -X POST http://localhost:8462/a2a/jsonrpc \
   }"
 ```
 
-Under the hood, claude-a2a maps `contextId` to a Claude CLI session ID and passes `--resume <session-id>` to maintain conversation state.
+Under the hood, claude-a2a keeps a long-lived Claude CLI process per session. If the process dies (e.g. server restart), it respawns with `--resume <session-id>` to recover the conversation.
 
 ## MCP client (for interactive Claude Code sessions)
 
@@ -333,13 +385,13 @@ The included MCP client lets an interactive Claude Code session call remote clau
   "servers": {
     "my-server": {
       "url": "http://192.168.1.80:8462",
-      "token": "Bearer my-secret-key"
+      "token": "my-secret-key"
     }
   }
 }
 ```
 
-2. Add the MCP server to your Claude Code configuration. In `.claude/settings.json` or `.mcp.json`:
+2. Add the MCP server to your project's `.mcp.json`:
 
 ```json
 {
@@ -352,6 +404,8 @@ The included MCP client lets an interactive Claude Code session call remote clau
   }
 }
 ```
+
+Restart Claude Code after adding the MCP config.
 
 ### Available MCP tools
 
@@ -429,6 +483,9 @@ npm test
 # Run tests in watch mode
 npm run test:watch
 
+# Lint
+npm run lint
+
 # Build
 npm run build
 ```
@@ -439,17 +496,22 @@ npm run build
 claude-a2a/
   src/
     cli.ts                        # CLI entry point (serve, client, token)
+    version.ts                    # Version constant
     server/
       index.ts                    # Express server setup, wires everything together
       config.ts                   # YAML config loading + Zod validation
       agent-card.ts               # Generates A2A Agent Card from config
-      claude-runner.ts            # Spawns and manages claude CLI subprocesses
-      agent-executor.ts           # A2A AgentExecutor: bridges A2A protocol to Claude Runner
+      claude-session.ts           # Long-lived Claude CLI process wrapper (NDJSON I/O)
+      claude-runner.ts            # Session pool manager
+      agent-executor.ts           # A2A executor: bridges A2A protocol to Claude Runner
       auth/
         middleware.ts             # Express auth middleware (master key + JWT)
         tokens.ts                 # JWT creation, verification, revocation
+        user.ts                   # User context type
       services/
+        database.ts               # SQLite connection with migrations
         session-store.ts          # Tracks Claude sessions by context ID
+        task-store.ts             # A2A task persistence with tenant isolation
         rate-limiter.ts           # Token-bucket rate limiter
         budget-tracker.ts         # Daily per-client and global cost tracking
       routes/
@@ -504,5 +566,6 @@ This lets clients track costs, monitor token usage, detect permission issues, an
 - [Express 5](https://expressjs.com/) — HTTP framework
 - [Zod](https://zod.dev/) — Config validation
 - [pino](https://getpino.io/) — Structured logging
+- [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) — SQLite for persistence
 - [Vitest](https://vitest.dev/) — Testing
 - [esbuild](https://esbuild.github.io/) — Build tool

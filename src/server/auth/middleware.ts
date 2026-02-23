@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from "express";
 import type { Logger } from "pino";
+import { timingSafeEqual } from "node:crypto";
 import type { Config } from "../config.js";
 import { verifyToken, type DecodedToken } from "./tokens.js";
 
@@ -17,6 +18,7 @@ declare global {
   namespace Express {
     interface Request {
       authContext?: AuthContext;
+      requestId?: string;
     }
   }
 }
@@ -45,8 +47,13 @@ export function createAuthMiddleware(config: Config, log: Logger) {
 
     const token = authHeader.replace(/^Bearer\s+/i, "");
 
-    // Try master key first
-    if (config.auth.master_key && token === config.auth.master_key) {
+    // Try master key first (timing-safe comparison)
+    const masterKey = config.auth.master_key;
+    if (
+      masterKey &&
+      Buffer.byteLength(token) === Buffer.byteLength(masterKey) &&
+      timingSafeEqual(Buffer.from(token), Buffer.from(masterKey))
+    ) {
       req.authContext = {
         type: "master",
         clientName: "master",
@@ -61,6 +68,14 @@ export function createAuthMiddleware(config: Config, log: Logger) {
     if (config.auth.jwt.secret) {
       try {
         const decoded: DecodedToken = verifyToken(config, token);
+
+        if (decoded.token_type === "refresh") {
+          res.status(401).json({
+            error: "Refresh tokens cannot be used for API access",
+          });
+          return;
+        }
+
         req.authContext = {
           type: decoded.ephemeral ? "ephemeral" : "jwt",
           clientName: decoded.sub,
@@ -79,33 +94,14 @@ export function createAuthMiddleware(config: Config, log: Logger) {
         );
         res.status(401).json({
           error: "Invalid or expired token",
-          detail: err instanceof Error ? err.message : undefined,
+          ...(config.auth.jwt.debug && err instanceof Error
+            ? { detail: err.message }
+            : {}),
         });
         return;
       }
     }
 
     res.status(401).json({ error: "Invalid credentials" });
-  };
-}
-
-export function requireScope(agentName: string) {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const auth = req.authContext;
-    if (!auth) {
-      res.status(401).json({ error: "Not authenticated" });
-      return;
-    }
-
-    if (auth.scopes.includes("*") || auth.scopes.includes(`agent:${agentName}`)) {
-      next();
-      return;
-    }
-
-    res.status(403).json({
-      error: "Insufficient scope",
-      required: `agent:${agentName}`,
-      provided: auth.scopes,
-    });
   };
 }

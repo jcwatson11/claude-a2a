@@ -26,15 +26,9 @@ const ConfigSchema = z.object({
     .object({
       host: z.string().default("0.0.0.0"),
       port: z.number().int().min(1).max(65535).default(8462),
-      tls: z
-        .object({
-          enabled: z.boolean().default(false),
-          cert_file: z.string().nullable().default(null),
-          key_file: z.string().nullable().default(null),
-        })
-        .default({}),
       max_concurrent: z.number().int().positive().default(4),
       request_timeout: z.number().positive().default(300),
+      max_body_size: z.string().default("10mb"),
     })
     .default({}),
   auth: z
@@ -43,8 +37,11 @@ const ConfigSchema = z.object({
       jwt: z
         .object({
           secret: z.string().nullable().default(null),
-          algorithm: z.string().default("HS256"),
-          default_expiry_hours: z.number().positive().default(720),
+          algorithm: z.enum(["HS256", "HS384", "HS512"]).default("HS256"),
+          default_expiry_hours: z.number().positive().default(168),
+          refresh_enabled: z.boolean().default(false),
+          refresh_max_expiry_hours: z.number().positive().default(720),
+          debug: z.boolean().default(false),
         })
         .default({}),
     })
@@ -54,6 +51,7 @@ const ConfigSchema = z.object({
       max_lifetime_hours: z.number().positive().default(168),
       max_idle_hours: z.number().positive().default(24),
       max_per_client: z.number().int().positive().default(50),
+      process_idle_timeout_minutes: z.number().positive().default(30),
     })
     .default({}),
   rate_limiting: z
@@ -69,12 +67,14 @@ const ConfigSchema = z.object({
       default_client_daily_limit_usd: z.number().positive().default(25.0),
     })
     .default({}),
+  data_dir: z.string().default("/var/lib/claude-a2a"),
   claude: z
     .object({
       binary: z.string().default("claude"),
       default_model: z.string().nullable().default(null),
       default_permission_mode: z.string().default("default"),
-      work_dir: z.string().default("/var/lib/claude-a2a/workdir"),
+      max_stdout_buffer_mb: z.number().positive().default(10),
+      work_dir: z.string().nullable().default(null),
     })
     .default({}),
   agents: z.record(z.string(), AgentConfigSchema).default({
@@ -117,8 +117,18 @@ export function loadConfig(configPath?: string): Config {
       port: parseInt(process.env["CLAUDE_A2A_PORT"], 10),
     };
   }
+  if (process.env["CLAUDE_A2A_DATA_DIR"]) {
+    raw["data_dir"] = process.env["CLAUDE_A2A_DATA_DIR"];
+  }
 
-  return ConfigSchema.parse(raw);
+  const config = ConfigSchema.parse(raw);
+
+  // Derive work_dir from data_dir if not explicitly set
+  if (!config.claude.work_dir) {
+    config.claude.work_dir = `${config.data_dir}/workdir`;
+  }
+
+  return config;
 }
 
 function resolveConfigPath(): string | undefined {

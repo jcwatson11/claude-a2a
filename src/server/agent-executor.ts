@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
-import type { Message, TaskStatusUpdateEvent } from "@a2a-js/sdk";
+import type { Message, Part } from "@a2a-js/sdk";
 import type {
   AgentExecutor,
   RequestContext,
@@ -11,11 +11,88 @@ import {
   CapacityError,
   TimeoutError,
   ClaudeProcessError,
+  SessionBusyError,
   type ClaudeResponse,
 } from "./claude-runner.js";
+import type { ContentBlock } from "./claude-session.js";
 import type { Config } from "./config.js";
+import { AuthenticatedUser } from "./auth/user.js";
 import { SessionStore } from "./services/session-store.js";
 import { BudgetTracker } from "./services/budget-tracker.js";
+
+// ---------------------------------------------------------------------------
+// A2A Part[] → Claude content block conversion
+// ---------------------------------------------------------------------------
+
+const IMAGE_MIME_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+
+/**
+ * Convert A2A message parts to Claude CLI content format.
+ *
+ * When all parts are text, returns a plain string (backward compat).
+ * When non-text parts are present, returns a ContentBlock[] array.
+ */
+export function convertPartsToMessage(
+  parts: Part[],
+): { message: string | ContentBlock[]; hasNonText: boolean } {
+  const hasNonText = parts.some((p) => p.kind !== "text");
+
+  // Fast path: text-only → plain string (identical to previous behavior)
+  if (!hasNonText) {
+    const text = parts
+      .filter((p): p is Extract<Part, { kind: "text" }> => p.kind === "text")
+      .map((p) => p.text)
+      .join("\n");
+    return { message: text, hasNonText: false };
+  }
+
+  // Multimodal path: build content blocks array
+  const blocks: ContentBlock[] = [];
+
+  for (const part of parts) {
+    if (part.kind === "text") {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.kind === "file") {
+      const file = part.file;
+      if ("bytes" in file) {
+        const mime = file.mimeType ?? "application/octet-stream";
+        if (IMAGE_MIME_TYPES.has(mime)) {
+          blocks.push({
+            type: "image",
+            source: { type: "base64", media_type: mime, data: file.bytes },
+          });
+        } else {
+          blocks.push({
+            type: "document",
+            source: { type: "base64", media_type: mime, data: file.bytes },
+          });
+        }
+        if (file.name) {
+          blocks.push({ type: "text", text: `[File: ${file.name}]` });
+        }
+      } else if ("uri" in file) {
+        const label = file.name ?? file.uri;
+        const mimeHint = file.mimeType ? ` (${file.mimeType})` : "";
+        blocks.push({
+          type: "text",
+          text: `[Referenced file: ${label}${mimeHint} — URI: ${file.uri}] (URI file download not supported; the file was not included.)`,
+        });
+      }
+    } else if (part.kind === "data") {
+      blocks.push({
+        type: "text",
+        text: JSON.stringify(part.data, null, 2),
+      });
+    }
+  }
+
+  return { message: blocks, hasNonText: true };
+}
 
 export class ClaudeAgentExecutor implements AgentExecutor {
   private readonly runner: ClaudeRunner;
@@ -44,11 +121,12 @@ export class ClaudeAgentExecutor implements AgentExecutor {
   ): Promise<void> {
     const { userMessage, taskId, contextId } = requestContext;
 
-    // Extract the text from the incoming message
-    const textParts = userMessage.parts.filter((p) => p.kind === "text");
-    const messageText = textParts.map((p) => p.text).join("\n");
-
-    if (!messageText.trim()) {
+    // Convert A2A parts to Claude content format
+    const { message: messageContent } = convertPartsToMessage(userMessage.parts);
+    const isEmpty = typeof messageContent === "string"
+      ? !messageContent.trim()
+      : messageContent.length === 0;
+    if (isEmpty) {
       this.publishMessage(eventBus, contextId, "Error: Empty message");
       return;
     }
@@ -66,41 +144,74 @@ export class ClaudeAgentExecutor implements AgentExecutor {
       return;
     }
 
-    // Extract client name from message metadata or request context
+    // Check scope authorization
+    if (agentConfig.required_scopes.length > 0) {
+      const userScopes = this.resolveScopes(requestContext, userMessage);
+      if (!userScopes.includes("*") &&
+          !agentConfig.required_scopes.some((s) => userScopes.includes(s))) {
+        this.publishMessage(
+          eventBus,
+          contextId,
+          `Error: Insufficient scope for agent "${agentName}". Required: ${agentConfig.required_scopes.join(", ")}`,
+        );
+        return;
+      }
+    }
+
+    // Extract client name from authenticated user or message metadata
+    const user = requestContext.context?.user;
     const clientName =
-      (requestContext.context as Record<string, unknown> | undefined)?.[
-        "clientName"
-      ] as string | undefined
+      (user instanceof AuthenticatedUser ? user.authContext.clientName : undefined)
       ?? (userMessage.metadata?.["clientName"] as string | undefined)
       ?? "anonymous";
 
-    // Check budget
-    const budgetError = this.budgetTracker.check(clientName);
+    // Check budget (per-client limit from JWT overrides the default)
+    const clientBudgetLimit = user instanceof AuthenticatedUser ? user.authContext.budgetDailyUsd : undefined;
+    const budgetError = this.budgetTracker.check(clientName, clientBudgetLimit);
     if (budgetError) {
       this.publishMessage(eventBus, contextId, `Error: ${budgetError}`);
       return;
     }
 
-    // Check capacity
-    if (this.runner.isFull) {
+    // Look up existing session for resume capability
+    const existingSession = this.sessionStore.getByContextId(contextId);
+
+    // Reject agent mismatch — a contextId is bound to the agent it was created with.
+    // Allowing reuse with a different agent would silently bypass the original agent's
+    // permissions, tools, and model config. This is a security concern in multi-tenant use.
+    if (existingSession && existingSession.agentName !== agentName) {
       this.publishMessage(
         eventBus,
         contextId,
-        "Error: Server at capacity, please retry later",
+        `Error: Context "${contextId}" belongs to agent "${existingSession.agentName}", ` +
+        `not "${agentName}". Use a new contextId to talk to a different agent.`,
       );
       return;
     }
 
-    // Look up existing session for this context
-    const existingSession = this.sessionStore.getByContextId(contextId);
-    const sessionId = existingSession?.sessionId;
+    // Check for orphaned process from a previous server run
+    if (existingSession && !existingSession.processAlive) {
+      const lastPid = this.sessionStore.getLastPid(contextId);
+      if (lastPid && this.isProcessAlive(lastPid)) {
+        this.publishMessage(
+          eventBus,
+          contextId,
+          "A previous Claude process for this session is still running. " +
+          "Cancel the task to terminate it, or wait for it to complete and retry.",
+          { orphan_pid: lastPid },
+        );
+        return;
+      }
+    }
 
     try {
-      const response = await this.runner.run({
+      const response = await this.runner.sendMessage({
         agentName,
         agentConfig,
-        message: messageText,
-        sessionId,
+        message: messageContent,
+        contextId,
+        taskId,
+        resumeSessionId: existingSession?.sessionId,
       });
 
       // Track session
@@ -114,6 +225,12 @@ export class ClaudeAgentExecutor implements AgentExecutor {
         );
       } else {
         this.sessionStore.update(response.session_id, response.total_cost_usd);
+      }
+
+      // Persist PID for orphan detection after restart
+      const pid = this.runner.getSessionPid(contextId);
+      if (pid) {
+        this.sessionStore.savePid(contextId, pid);
       }
 
       // Track budget
@@ -141,6 +258,8 @@ export class ClaudeAgentExecutor implements AgentExecutor {
       let errorText: string;
       if (err instanceof CapacityError) {
         errorText = `Error: ${err.message}`;
+      } else if (err instanceof SessionBusyError) {
+        errorText = "Error: Session is currently processing another message. Please wait.";
       } else if (err instanceof TimeoutError) {
         errorText = `Error: ${err.message}`;
       } else if (err instanceof ClaudeProcessError) {
@@ -155,10 +274,43 @@ export class ClaudeAgentExecutor implements AgentExecutor {
   }
 
   async cancelTask(
-    _taskId: string,
+    taskId: string,
     _eventBus: ExecutionEventBus,
   ): Promise<void> {
-    this.log.warn("cancelTask not implemented");
+    const cancelled = this.runner.cancelByTaskId(taskId, this.sessionStore);
+    if (cancelled) {
+      this.log.info({ taskId }, "task cancelled");
+    } else {
+      this.log.warn({ taskId }, "cancelTask: no active process found for task");
+    }
+  }
+
+  /** Check if a process with the given PID is still alive. */
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private resolveScopes(
+    requestContext: RequestContext,
+    message: Message,
+  ): string[] {
+    // From message metadata (used in tests and direct API calls)
+    const metaScopes = message.metadata?.["scopes"];
+    if (Array.isArray(metaScopes)) return metaScopes as string[];
+
+    // From the authenticated user (set by auth middleware → userBuilder → ServerCallContext)
+    const user = requestContext.context?.user;
+    if (user instanceof AuthenticatedUser) {
+      return user.authContext.scopes;
+    }
+
+    // No scopes found — default to empty (deny)
+    return [];
   }
 
   private resolveAgentName(message: Message): string {

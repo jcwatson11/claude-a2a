@@ -4,12 +4,9 @@
 server:
   host: "0.0.0.0"
   port: 8462
-  tls:
-    enabled: false
-    cert_file: null
-    key_file: null
   max_concurrent: 4
   request_timeout: 300
+  max_body_size: "100kb"
 
 auth:
   # Master key: set via CLAUDE_A2A_MASTER_KEY env var
@@ -18,12 +15,14 @@ auth:
     # JWT secret: set via CLAUDE_A2A_JWT_SECRET env var
     secret: null
     algorithm: "HS256"
-    default_expiry_hours: 720  # 30 days
+    default_expiry_hours: 168  # 7 days; tokens can be refreshed up to 30 days (refresh_max_expiry_hours)
+    debug: false  # set true to include error details in 401 responses
 
 sessions:
   max_lifetime_hours: 168   # 7 days
   max_idle_hours: 24
   max_per_client: 50
+  process_idle_timeout_minutes: 30  # kill idle Claude processes after 30 min
 
 rate_limiting:
   enabled: true
@@ -34,11 +33,17 @@ budgets:
   global_daily_limit_usd: 100.0
   default_client_daily_limit_usd: 25.0
 
+# All persistent data is stored in a SQLite database at data_dir/claude-a2a.db.
+# Mount this as a Docker volume for persistence across container restarts.
+# Override via CLAUDE_A2A_DATA_DIR env var.
+data_dir: "/var/lib/claude-a2a"
+
 claude:
   binary: "claude"
   default_model: null  # uses claude's default
   default_permission_mode: "default"
-  work_dir: "/var/lib/claude-a2a/workdir"
+  max_stdout_buffer_mb: 10  # kill session if stdout buffer exceeds this (no-newline safety valve)
+  work_dir: null  # defaults to data_dir/workdir
 
 agents:
   general:

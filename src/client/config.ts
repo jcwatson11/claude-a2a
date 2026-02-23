@@ -1,15 +1,19 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
+import { z } from "zod";
 
-export interface ServerEntry {
-  url: string;
-  token: string;
-}
+const ServerEntrySchema = z.object({
+  url: z.string().url(),
+  token: z.string(),
+});
 
-export interface ClientConfig {
-  servers: Record<string, ServerEntry>;
-}
+const ClientConfigSchema = z.object({
+  servers: z.record(z.string(), ServerEntrySchema).default({}),
+});
+
+export type ServerEntry = z.infer<typeof ServerEntrySchema>;
+export type ClientConfig = z.infer<typeof ClientConfigSchema>;
 
 export function loadClientConfig(): ClientConfig {
   const candidates = [
@@ -21,7 +25,8 @@ export function loadClientConfig(): ClientConfig {
   for (const path of candidates) {
     if (path && existsSync(path)) {
       const content = readFileSync(path, "utf-8");
-      return JSON.parse(content) as ClientConfig;
+      const parsed: unknown = JSON.parse(content);
+      return ClientConfigSchema.parse(parsed);
     }
   }
 
