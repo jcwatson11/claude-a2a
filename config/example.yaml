@@ -6,7 +6,7 @@ server:
   port: 8462
   max_concurrent: 4
   request_timeout: 300
-  max_body_size: "100kb"
+  max_body_size: "10mb"
 
 auth:
   # Master key: set via CLAUDE_A2A_MASTER_KEY env var
@@ -54,11 +54,11 @@ agents:
     settings_file: null
     permission_mode: "default"
     allowed_tools:
-      - "Read(*)"
-      - "Glob(*)"
-      - "Grep(*)"
-      - "WebSearch(*)"
-      - "WebFetch(*)"
+      - "Read"
+      - "Glob"
+      - "Grep"
+      - "WebSearch"
+      - "WebFetch"
     max_budget_usd: 1.0
     required_scopes:
       - "agent:general"
@@ -72,12 +72,12 @@ agents:
   #   append_system_prompt: "You are a code assistant responding via A2A API."
   #   permission_mode: "default"
   #   allowed_tools:
-  #     - "Read(*)"
-  #     - "Write(*)"
-  #     - "Edit(*)"
-  #     - "Glob(*)"
-  #     - "Grep(*)"
-  #     - "Bash(*)"
+  #     - "Read"
+  #     - "Write"
+  #     - "Edit"
+  #     - "Glob"
+  #     - "Grep"
+  #     - "Bash"
   #   max_budget_usd: 5.0
   #   required_scopes:
   #     - "agent:code"

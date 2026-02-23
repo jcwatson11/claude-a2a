@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "A2A-compatible server wrapping the Claude CLI for agent-to-agent communication",
   "type": "module",
+  "files": [
+    "dist/",
+    "config/example.yaml"
+  ],
   "bin": {
     "claude-a2a": "./dist/cli.js",
     "claude-a2a-client": "./dist/client.js"

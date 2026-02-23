@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { loadConfig } from "../../src/server/config.js";
-import { writeFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { loadConfig, buildConfigFromFlags } from "../../src/server/config.js";
+import { writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 const tmpDir = join(import.meta.dirname, ".tmp-config-test");
 
@@ -14,6 +14,7 @@ afterEach(() => {
   delete process.env["CLAUDE_A2A_MASTER_KEY"];
   delete process.env["CLAUDE_A2A_JWT_SECRET"];
   delete process.env["CLAUDE_A2A_PORT"];
+  delete process.env["CLAUDE_A2A_DATA_DIR"];
 });
 
 describe("loadConfig", () => {
@@ -121,6 +122,80 @@ claude:
     const config = loadConfig("/nonexistent/path.yaml");
     expect(config.data_dir).toBe("/docker/volume");
     expect(config.claude.work_dir).toBe("/docker/volume/workdir");
-    delete process.env["CLAUDE_A2A_DATA_DIR"];
+  });
+});
+
+describe("buildConfigFromFlags", () => {
+  it("creates valid config with just agent name", () => {
+    const config = buildConfigFromFlags({ agent: "myagent" });
+    expect(config.agents["myagent"]).toBeDefined();
+    expect(config.agents["myagent"]!.enabled).toBe(true);
+    expect(config.agents["general"]).toBeUndefined();
+    expect(config.server.port).toBe(8462);
+  });
+
+  it("applies workDir and auto-detects settings.json", () => {
+    const workDir = join(tmpDir, "workspace");
+    const claudeDir = join(workDir, ".claude");
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(join(claudeDir, "settings.json"), "{}");
+
+    const config = buildConfigFromFlags({ agent: "test", workDir });
+    const agent = config.agents["test"]!;
+    expect(agent.work_dir).toBe(resolve(workDir));
+    expect(agent.settings_file).toBe(
+      resolve(workDir, ".claude", "settings.json"),
+    );
+  });
+
+  it("sets settings_file to null when no settings.json exists", () => {
+    const config = buildConfigFromFlags({
+      agent: "test",
+      workDir: "/nonexistent/path",
+    });
+    expect(config.agents["test"]!.settings_file).toBeNull();
+  });
+
+  it("applies model, permissionMode, systemPrompt, maxBudget", () => {
+    const config = buildConfigFromFlags({
+      agent: "test",
+      model: "claude-sonnet-4-6",
+      permissionMode: "bypassPermissions",
+      systemPrompt: "Be helpful.",
+      maxBudget: 5.0,
+    });
+    const agent = config.agents["test"]!;
+    expect(agent.model).toBe("claude-sonnet-4-6");
+    expect(agent.permission_mode).toBe("bypassPermissions");
+    expect(agent.append_system_prompt).toBe("Be helpful.");
+    expect(agent.max_budget_usd).toBe(5.0);
+  });
+
+  it("applies port and host overrides", () => {
+    const config = buildConfigFromFlags({
+      agent: "test",
+      port: 9000,
+      host: "127.0.0.1",
+    });
+    expect(config.server.port).toBe(9000);
+    expect(config.server.host).toBe("127.0.0.1");
+  });
+
+  it("applies env var overrides for auth", () => {
+    process.env["CLAUDE_A2A_MASTER_KEY"] = "flag-key";
+    const config = buildConfigFromFlags({ agent: "test" });
+    expect(config.auth.master_key).toBe("flag-key");
+  });
+
+  it("uses local data_dir by default", () => {
+    const config = buildConfigFromFlags({ agent: "test" });
+    expect(config.data_dir).toBe("./data");
+    expect(config.claude.work_dir).toBe("./data/workdir");
+  });
+
+  it("respects CLAUDE_A2A_DATA_DIR env var", () => {
+    process.env["CLAUDE_A2A_DATA_DIR"] = "/custom/data";
+    const config = buildConfigFromFlags({ agent: "test" });
+    expect(config.data_dir).toBe("/custom/data");
   });
 });

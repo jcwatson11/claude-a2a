@@ -85,16 +85,7 @@ const ConfigSchema = z.object({
 export type Config = z.infer<typeof ConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 
-export function loadConfig(configPath?: string): Config {
-  const path = configPath ?? resolveConfigPath();
-
-  let raw: Record<string, unknown> = {};
-  if (path && existsSync(path)) {
-    const content = readFileSync(path, "utf-8");
-    raw = (parseYaml(content) as Record<string, unknown>) ?? {};
-  }
-
-  // Apply env var overrides for secrets
+export function applyEnvOverrides(raw: Record<string, unknown>): void {
   if (process.env["CLAUDE_A2A_MASTER_KEY"]) {
     raw["auth"] = {
       ...(raw["auth"] as Record<string, unknown> | undefined),
@@ -120,8 +111,83 @@ export function loadConfig(configPath?: string): Config {
   if (process.env["CLAUDE_A2A_DATA_DIR"]) {
     raw["data_dir"] = process.env["CLAUDE_A2A_DATA_DIR"];
   }
+}
+
+export function loadConfig(configPath?: string): Config {
+  const path = configPath ?? resolveConfigPath();
+
+  let raw: Record<string, unknown> = {};
+  if (path && existsSync(path)) {
+    const content = readFileSync(path, "utf-8");
+    raw = (parseYaml(content) as Record<string, unknown>) ?? {};
+  }
+
+  applyEnvOverrides(raw);
 
   const config = ConfigSchema.parse(raw);
+
+  // Derive work_dir from data_dir if not explicitly set
+  if (!config.claude.work_dir) {
+    config.claude.work_dir = `${config.data_dir}/workdir`;
+  }
+
+  return config;
+}
+
+export interface ServeFlags {
+  agent: string;
+  workDir?: string;
+  model?: string;
+  permissionMode?: string;
+  systemPrompt?: string;
+  maxBudget?: number;
+  port?: number;
+  host?: string;
+}
+
+export function buildConfigFromFlags(flags: ServeFlags): Config {
+  const raw: Record<string, unknown> = {};
+
+  // Set data_dir to local ./data unless env override
+  if (!process.env["CLAUDE_A2A_DATA_DIR"]) {
+    raw["data_dir"] = "./data";
+  }
+
+  // Apply port/host if provided via flags
+  if (flags.port !== undefined || flags.host !== undefined) {
+    const server: Record<string, unknown> = {};
+    if (flags.port !== undefined) server["port"] = flags.port;
+    if (flags.host !== undefined) server["host"] = flags.host;
+    raw["server"] = server;
+  }
+
+  applyEnvOverrides(raw);
+
+  const config = ConfigSchema.parse(raw);
+
+  // Build the single agent entry
+  const workDir = flags.workDir
+    ? resolve(flags.workDir)
+    : undefined;
+
+  const settingsFile =
+    workDir && existsSync(resolve(workDir, ".claude", "settings.json"))
+      ? resolve(workDir, ".claude", "settings.json")
+      : null;
+
+  const agentConfig: Record<string, unknown> = {
+    work_dir: workDir ?? null,
+    settings_file: settingsFile,
+  };
+  if (flags.model) agentConfig["model"] = flags.model;
+  if (flags.permissionMode)
+    agentConfig["permission_mode"] = flags.permissionMode;
+  if (flags.systemPrompt)
+    agentConfig["append_system_prompt"] = flags.systemPrompt;
+  if (flags.maxBudget) agentConfig["max_budget_usd"] = flags.maxBudget;
+
+  const parsedAgent = AgentConfigSchema.parse(agentConfig);
+  config.agents = { [flags.agent]: parsedAgent };
 
   // Derive work_dir from data_dir if not explicitly set
   if (!config.claude.work_dir) {

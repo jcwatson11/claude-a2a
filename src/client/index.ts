@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadClientConfig } from "./config.js";
 import { createMcpServer } from "./mcp-server.js";
