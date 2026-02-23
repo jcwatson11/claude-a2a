@@ -74,6 +74,17 @@ Text-only messages are sent as plain strings for backward compatibility. When no
 
 Supported input MIME types are advertised in the Agent Card's `defaultInputModes`: `text`, `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `application/pdf`.
 
+## Installation
+
+```bash
+# Use directly with npx (no install needed)
+CLAUDE_A2A_MASTER_KEY=my-secret-key npx claude-a2a-cli serve --agent my-agent
+
+# Or install globally
+npm install -g claude-a2a-cli
+CLAUDE_A2A_MASTER_KEY=my-secret-key claude-a2a serve --agent my-agent
+```
+
 ## Requirements
 
 - **Node.js** >= 18 (tested with 24)
@@ -81,17 +92,46 @@ Supported input MIME types are advertised in the Agent Card's `defaultInputModes
 
 ## Quick start
 
+### Option A: npx (no clone required)
+
 ```bash
-# Clone and install
+# Scaffold a config in the current directory
+npx claude-a2a-cli init --yes
+
+# Start the server
+CLAUDE_A2A_MASTER_KEY=my-secret-key npx claude-a2a-cli serve
+```
+
+### Option B: Single-agent mode (no config file at all)
+
+```bash
+# Start a single agent directly from CLI flags
+CLAUDE_A2A_MASTER_KEY=my-secret-key npx claude-a2a-cli serve \
+  --agent my-agent \
+  --work-dir ./my-project \
+  --model claude-sonnet-4-6 \
+  --max-budget 5.0
+```
+
+### Option C: Clone and build
+
+```bash
 cd claude-a2a
 npm install
 npm run build
 
 # Start with a master key for auth
 CLAUDE_A2A_MASTER_KEY=my-secret-key ./dist/cli.js serve
+```
 
-# In another terminal — check health
+### Verify it works
+
+```bash
+# Check health
 curl http://localhost:8462/health
+
+# View the agent card
+curl http://localhost:8462/.well-known/agent-card.json
 
 # Send a message
 curl -X POST http://localhost:8462/a2a/jsonrpc \
@@ -117,7 +157,38 @@ curl -X POST http://localhost:8462/a2a/jsonrpc \
 
 ## Configuration
 
-claude-a2a is configured via a YAML file. It looks for config in this order:
+There are three ways to configure the server:
+
+### 1. `init` command (recommended for new projects)
+
+```bash
+claude-a2a init              # interactive prompts
+claude-a2a init --yes        # non-interactive with defaults
+claude-a2a init --yes -d ./my-project  # specify target directory
+```
+
+This scaffolds a `config.yaml` and a `.claude/settings.json` with tool permissions.
+
+### 2. Single-agent CLI flags (no config file)
+
+```bash
+claude-a2a serve --agent <name> [options]
+```
+
+| Flag | Description |
+|---|---|
+| `--agent <name>` | Agent name (enables single-agent mode) |
+| `--work-dir <path>` | Agent working directory |
+| `--model <model>` | Claude model (e.g. `claude-sonnet-4-6`) |
+| `--permission-mode <mode>` | Permission mode (default: `default`) |
+| `--system-prompt <text>` | System prompt |
+| `--max-budget <usd>` | Max budget per invocation in USD |
+
+When `--agent` is set, the server skips config file lookup entirely. Data is stored in `./data` by default.
+
+### 3. YAML config file
+
+The server looks for a config file in this order:
 
 1. Path passed via `--config` / `-c` flag
 2. `./config.yaml` in the current directory
@@ -138,6 +209,7 @@ Secrets should be set via environment variables rather than in the config file:
 | `CLAUDE_A2A_MASTER_KEY` | Master authentication key (full access) |
 | `CLAUDE_A2A_JWT_SECRET` | Secret for signing/verifying JWT tokens |
 | `CLAUDE_A2A_PORT` | Override server port (default: 8462) |
+| `CLAUDE_A2A_DATA_DIR` | Override data directory (default: `/var/lib/claude-a2a` or `./data` in single-agent mode) |
 | `CLAUDE_A2A_CONFIG` | Override config file path |
 | `LOG_LEVEL` | Logging level: `debug`, `info`, `warn`, `error` (default: `info`) |
 
@@ -312,11 +384,11 @@ Scoped tokens with per-client controls. Generate them using the CLI:
 ```bash
 # Generate a token for "my-agent" with access to the "general" agent
 CLAUDE_A2A_JWT_SECRET=your-jwt-secret \
-  ./dist/cli.js token my-agent agent:general
+  npx claude-a2a-cli token my-agent agent:general
 
 # Generate a token with access to all agents
 CLAUDE_A2A_JWT_SECRET=your-jwt-secret \
-  ./dist/cli.js token my-agent '*'
+  npx claude-a2a-cli token my-agent '*'
 ```
 
 JWT claims can include:
@@ -495,7 +567,8 @@ npm run build
 ```
 claude-a2a/
   src/
-    cli.ts                        # CLI entry point (serve, client, token)
+    cli.ts                        # CLI entry point (serve, init, client, token)
+    init.ts                       # Interactive config scaffolding
     version.ts                    # Version constant
     server/
       index.ts                    # Express server setup, wires everything together

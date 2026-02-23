@@ -1,6 +1,6 @@
 {
   "name": "claude-a2a-cli",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A2A-compatible server wrapping the Claude CLI for agent-to-agent communication",
   "repository": {
     "type": "git",
